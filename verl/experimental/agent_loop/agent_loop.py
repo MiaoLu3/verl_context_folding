@@ -392,7 +392,18 @@ class AgentLoopWorkerBase:
             )
         outputs = await asyncio.gather(*tasks)
 
-        output = self._postprocess(outputs)
+        # Flatten outputs: each _run_agent_loop returns list[_InternalAgentLoopOutput]
+        # For single-output agent loops, this is a list with one element
+        # For multi-output agent loops (e.g., FoldAgentLoop), this can have multiple elements
+        flattened_outputs = []
+        for output_list in outputs:
+            if isinstance(output_list, list):
+                flattened_outputs.extend(output_list)
+            else:
+                # Backward compatibility: if somehow a single output is returned
+                flattened_outputs.append(output_list)
+
+        output = self._postprocess(flattened_outputs)
 
         return output
 
@@ -404,7 +415,15 @@ class AgentLoopWorkerBase:
         agent_name: str,
         trace: bool = True,
         **kwargs,
-    ) -> _InternalAgentLoopOutput:
+    ) -> list[_InternalAgentLoopOutput]:
+        """
+        Run an agent loop and return processed outputs.
+
+        Returns:
+            list[_InternalAgentLoopOutput]: A list of processed outputs.
+            Most agent loops return a single output (wrapped in a list for consistency),
+            but some (e.g., FoldAgentLoop) may return multiple outputs (one per agent trajectory).
+        """
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -425,8 +444,19 @@ class AgentLoopWorkerBase:
                 tokenizer=self.tokenizer,
                 processor=self.processor,
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, **kwargs)
+            output = await agent_loop.run(sampling_params, **kwargs)
+
+            # Handle both single AgentLoopOutput and list[AgentLoopOutput]
+            if isinstance(output, list):
+                # Agent loop returned multiple outputs (e.g., FoldAgentLoop)
+                processed_outputs = []
+                for single_output in output:
+                    processed = await self._agent_loop_postprocess(single_output, **kwargs)
+                    processed_outputs.append(processed)
+                return processed_outputs
+            else:
+                # Single output (most agent loops) - wrap in list for consistency
+                return [await self._agent_loop_postprocess(output, **kwargs)]
 
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
