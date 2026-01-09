@@ -13,6 +13,10 @@ import logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SEARCH_URL = os.getenv("LOCAL_SEARCH_URL")
+
+
 GRADER_TEMPLATE = """
 Judge whether the following [response] to [question] is correct or not based on the precise and unambiguous [correct_answer] below.
 
@@ -175,7 +179,7 @@ def relaxed_em(label: str, pred: str) -> bool:
 
 
 async def call_openai(messages, model='gpt-5-nano', max_retries=3):
-    openai_url = os.getenv("OPENAI_URL")
+    openai_url = "http://[fdbd:dc03:15:203::146]:8000/chat"
     for attempt in range(max_retries):
         try:
             async with httpx.AsyncClient(timeout=300.0) as c:
@@ -197,7 +201,7 @@ async def call_openai_raw(messages, model='gpt-4o-mini', max_retries=3):
     from openai import AsyncOpenAI
     if isinstance(messages, str):
         messages = [{'role': 'user', 'content': messages}]
-    client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     for attempt in range(max_retries):
         try:
             resp = await client.chat.completions.create(model=model, messages=messages)
@@ -227,14 +231,14 @@ async def judge(question, correct_answer, predicted_answer):
         messages = [{'role': 'user', 'content': judge_prompt}]
         score = 0
         for _ in range(3):
-            response = await call_openai_raw(messages)  # use call_openai for api proxy
+            response = await call_openai(messages)  # use call_openai for api proxy
             grade_report = parse_judge_response(response)
             if grade_report['parse_error']:
                 continue
             score = int(grade_report['correct'])
             break
         if score == 0 and relaxed_em(correct_answer, predicted_answer):
-            response = await call_openai_raw(messages, model='gpt-4.1')  # use call_openai for api proxy
+            response = await call_openai(messages, model='gpt-4.1')  # use call_openai for api proxy
             grade_report = parse_judge_response(response)
             score = int(grade_report.get('correct', 0))
 
@@ -371,7 +375,7 @@ class LocalSearch:
         self.stats['visit_pages'] = 0
         self.env_fail = False
 
-        base_url = os.getenv("LOCAL_SEARCH_URL")
+        base_url = SEARCH_URL
 
         self.client = AsyncSearchClient(base_url=base_url)
         self.question = None
@@ -387,6 +391,8 @@ class LocalSearch:
         self.question = item.non_tensor_batch['extra_info'][0]['query']
         self.label_answer = item.non_tensor_batch['extra_info'][0]['answer']
         self.predicted_answer = None
+        print("init self.question:", self.question)
+        print("init self.label_answer:", self.label_answer)
 
     async def get_data(self, item, context):
         if 'prompt' in item.non_tensor_batch['extra_info'][0]:
@@ -407,17 +413,18 @@ class LocalSearch:
         meta_info = copy.copy(item.meta_info)
         meta_info['uid'] = item.non_tensor_batch['uid'][0]
         meta_info['reward_model'] = item.non_tensor_batch['reward_model'][0]
+        max_turn = self.config.plugin.max_turn
 
-        if "max_turn" in item.meta_info:
-            max_turn = item.meta_info["max_turn"]
-        else:
-            if context.is_train:
-                max_turn = self.config.plugin.max_turn
-            else:
-                if "val_max_turn" in self.config.plugin:
-                    max_turn = self.config.plugin.val_max_turn
-                else:
-                    max_turn = self.config.plugin.max_turn
+        # if "max_turn" in item.meta_info:
+        #     max_turn = item.meta_info["max_turn"]
+        # else:
+        #     if context.is_train:
+        #         max_turn = self.config.plugin.max_turn
+        #     else:
+        #         if "val_max_turn" in self.config.plugin:
+        #             max_turn = self.config.plugin.val_max_turn
+        #         else:
+        #             max_turn = self.config.plugin.max_turn
         return conversations, {'max_turn': max_turn, 'meta_info': meta_info}
 
     async def run_action(self, response):
@@ -488,7 +495,7 @@ class LocalSearch:
                     explanation = fn['arguments'].get('explanation', None)
                     confidence = fn['arguments'].get('confidence', None)
                     if len(answer.strip()) == 0:
-                        print(response)
+                        print("Finish response:", response)
                         observation = ("Fail to parse answer. Please resubmit with the correct tool call format, eg\n"
                                        "<function=finish>\n" "<parameter=answer>YOUR ANSWER</parameter>\n"
                                        "<parameter=explanation>YOUR EXPLANATION</parameter>\n"
@@ -499,6 +506,7 @@ class LocalSearch:
                             self.stats['change_answer'] += 1
 
                     if self.stats['search'] == 0:
+                        print("[Search = 0] Label answer:", self.label_answer, "Predicted answer:", answer)
                         if em_score(self.label_answer, answer) and self.must_search:
                             observation = "Answer submission failed. You MUST use the search tool to verify the answer and all the evidence, and cite the correct source document in your explanation to support your claim."
                             self.must_search = False
@@ -547,20 +555,27 @@ Once you’re confident everything is covered and verified, submit the final ans
 
     async def get_reward(self, item, messages, context):
         if self.env_fail:  # If env fail, direct return 0 reward
+            print("[Not Judged] Env fail, return 0 reward")
             return "", 0, {}
         if self.predicted_answer is None:
+            print("[Not Judged] Predicted answer is None, return 0 reward")
             return "", 0, {}
-        # print(self.label_answer)
-        # print(self.predicted_answer[0])
+        print("Label answer:", self.label_answer)
+        print("Predicted answer:", self.predicted_answer)
         if '<q1>' in self.label_answer:
             label_answer_dict = extract_q_dict(self.label_answer)
+            print("extracted label answer dict:", label_answer_dict)
             predicted_answer_dict = extract_q_dict(self.predicted_answer[0])
+            print("extracted predicted answer dict:", predicted_answer_dict)
             all_reward = []
             for k in label_answer_dict:
                 if k in predicted_answer_dict:
+                    print(f"judging question {k}")
                     reward = await judge(self.question, label_answer_dict[k], predicted_answer_dict[k])
+                    print(f"judge reward for question {k}:", reward)
                     all_reward.append(reward)
                 else:
+                    print(f"question {k} not in predicted answer dict")
                     all_reward.append(0)
             reward = sum(all_reward) / len(all_reward)
             return "", reward, {}
@@ -585,6 +600,7 @@ Once you’re confident everything is covered and verified, submit the final ans
         return out
 
 def extract_q_dict(s: str) -> dict[str, str]:
+    print(f"extracting q dict from {s}")
     return {k: v.strip() for k, v in re.findall(r'<(q\d+)>(.*?)</\1>', s, flags=re.S)}
 
 

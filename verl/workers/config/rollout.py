@@ -114,6 +114,24 @@ class PrometheusConfig(BaseConfig):
 
 
 @dataclass
+class PlugInConfig(BaseConfig):
+    workflow: str = "search"
+    max_turn: int = 20
+    retry_cjk: int = 10 
+    max_new_tokens: int = 2048
+    max_session: int = 1
+    session_timeout: int = 3600 
+    enable_summary: bool = False
+    branch_len: int = 256 
+    process_reward: str = "flat"
+    max_traj: int = 3
+    must_finish: bool = False
+    double_check: bool = False
+    must_search: bool = True
+    val_max_turn: int = 20
+    val_response_length: int = 16384
+
+@dataclass
 class RolloutConfig(BaseConfig):
     _mutable_fields = {"max_model_len", "load_format"}
 
@@ -168,6 +186,8 @@ class RolloutConfig(BaseConfig):
     calculate_log_probs: bool = False
 
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
+
+    plugin: PlugInConfig = field(default_factory=PlugInConfig)
 
     trace: TraceConfig = field(default_factory=TraceConfig)
 

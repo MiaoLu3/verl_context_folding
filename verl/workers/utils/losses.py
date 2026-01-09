@@ -107,6 +107,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     metrics = {}
 
     response_mask = data["response_mask"].to(bool)
+    overlong_mask = data.get("overlong_mask", None)
     # compute policy loss
     old_log_prob = data["old_log_probs"]
     advantages = data["advantages"]
@@ -125,6 +126,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         loss_agg_mode=loss_agg_mode,
         config=config,
         rollout_is_weights=rollout_is_weights,
+        overlong_mask=overlong_mask,
     )
 
     metrics.update(pg_metrics)

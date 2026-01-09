@@ -19,5 +19,6 @@ training infrastructure while keeping custom tool parsing and environments.
 """
 
 from .react_agent_loop import ReactAgentLoop
+from .fold_agent_loop import FoldAgentLoop
 
-__all__ = ["ReactAgentLoop"]
+__all__ = ["ReactAgentLoop", "FoldAgentLoop"]

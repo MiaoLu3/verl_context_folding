@@ -468,6 +468,7 @@ class MegatronPPOActor(BasePPOActor):
             responses = data["responses"]
             response_length = responses.size(1)
             response_mask = data["response_mask"].to(bool)
+            overlong_mask = data.get("overlong_mask", None)
             loss_agg_mode = self.config.loss_agg_mode
             # compute policy loss
             log_prob = log_probs[:, -response_length - 1 : -1].contiguous()
@@ -495,6 +496,7 @@ class MegatronPPOActor(BasePPOActor):
                     loss_agg_mode=loss_agg_mode,
                     config=self.config,
                     rollout_is_weights=rollout_is_weights,
+                    overlong_mask=overlong_mask,
                 )
                 stats.update(pg_metrics)
 

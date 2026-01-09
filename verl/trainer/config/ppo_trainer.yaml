@@ -119,6 +119,12 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # Overlong mask 
+  mask_overlong: True
+
+  # Whether to fix bad positive advantages
+  fix_bad_positive_adv: False
+
 # config for the trainer
 trainer:
 

@@ -461,3 +461,8 @@ class AlgoConfig(BaseConfig):
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
+    # Overlong mask 
+    mask_overlong: bool = True
+    # Whether to fix bad positive advantages
+    fix_bad_positive_adv: bool = False
+

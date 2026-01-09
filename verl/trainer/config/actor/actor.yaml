@@ -32,6 +32,8 @@ use_dynamic_bsz: false
 # oc.select: the default val for ref.log_prob_max_token_len_per_gpu
 ppo_max_token_len_per_gpu: 16384
 
+ppo_infer_max_token_len_per_gpu: 16384
+
 # PPO clip ratio
 clip_ratio: 0.2
 

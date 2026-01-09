@@ -43,6 +43,7 @@ PolicyLossFn = Callable[
         str,  # loss_agg_mode
         Optional[DictConfig | ActorConfig],  # config
         torch.Tensor | None,  # rollout_log_probs
+        torch.Tensor | None,  # overlong_mask
     ],
     tuple[torch.Tensor, dict[str, Any]],
 ]
@@ -105,6 +106,7 @@ class AdvantageEstimator(str, Enum):
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
+    FOLDGRPO = "foldgrpo"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -324,6 +326,117 @@ def compute_grpo_outcome_advantage(
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
         scores = scores.unsqueeze(-1) * response_mask
+
+    return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.FOLDGRPO)
+def compute_foldgrpo_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    gen_uid: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    fix_bad_positive_adv: bool = False,
+    process_reward_mask: Optional[torch.Tensor] = None,
+    raw_token_level_scores: Optional[torch.Tensor] = None,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantage for FoldGRPO (https://arxiv.org/abs/2510.11967)
+
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape is (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape is (bs, response_length)
+        index: `(np.ndarray)`
+            index array for grouping
+        gen_uid: `(np.ndarray)`
+            gen_uid array for de-repeating the same rollout
+        epsilon: `(float)`
+            small value to avoid division by zero
+        norm_adv_by_std_in_grpo: `(bool)`
+            whether to scale the GRPO advantage
+        fix_bad_positive_adv: `(bool)`
+            whether to fix bad positive advantage
+        process_reward_mask: `(Optional[torch.Tensor])`
+            shape is (bs, response_length)
+        raw_token_level_scores: `(Optional[torch.Tensor])`
+            shape is (bs, response_length)
+        config: `(Optional[AlgoConfig])`
+            algorithm configuration object
+
+    Note:
+        If norm_adv_by_std_in_grpo is True, the advantage is scaled by the std, as in the original GRPO.
+        If False, the advantage is not scaled, as in Dr.GRPO (https://arxiv.org/abs/2503.20783).
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape is (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape is (bs, response_length)
+    """
+    response_length = token_level_rewards.shape[-1]
+    scores = token_level_rewards.sum(dim=-1)
+    metrics = {}
+    id2score = defaultdict(list)
+    id2gen_uid = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+
+    # check necessary arguments for using fix_bad_positive_adv
+    raw_scores = None if raw_token_level_scores is None else raw_token_level_scores.sum(-1)
+    if fix_bad_positive_adv:
+        assert raw_scores is not None, "raw_scores should not be None when fix_bad_positive_adv"
+
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            # de-repeating trajectory from the same rollout when calculating group mean and std
+            if gen_uid[i] in id2gen_uid[index[i]]:
+                continue
+            else:
+                id2gen_uid[index[i]].append(gen_uid[i])
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+                id2std[idx] = torch.tensor(1.0)
+            elif len(id2score[idx]) > 1:
+                scores_tensor = torch.stack(id2score[idx])
+                id2mean[idx] = torch.mean(scores_tensor)
+                id2std[idx] = torch.std(scores_tensor)
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        for i in range(bsz):
+            if norm_adv_by_std_in_grpo:
+                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            else:
+                scores[i] = scores[i] - id2mean[index[i]]
+            if fix_bad_positive_adv and scores[i] > 0  and raw_scores[i] < 0: 
+                scores[i] = 0.0 * scores[i]
+
+        # TODO@Miao: Implement other variants of handling process_reward in https://arxiv.org/abs/2510.11967
+        if process_reward_mask is not None:
+            gmin, gmax = {}, {}
+            for k, s in zip(index, scores):
+                gmin[k], gmax[k] = torch.minimum(s, gmin.get(k, s)), torch.maximum(s, gmax.get(k, s))
+            for k in gmin:  # patch all 0/1
+                if gmin[k] >= 0:
+                    gmin[k] = gmin[k] * 0 - 1
+                if gmax[k] <= 0:
+                    gmax[k] = gmax[k] * 0 + 1
+            gmax = torch.stack([gmax[k] for k in index]).unsqueeze(dim=1).tile([1, response_length])
+            gmin = torch.stack([gmin[k] for k in index]).unsqueeze(dim=1).tile([1, response_length])
+            scores = scores.unsqueeze(dim=1).tile([1, response_length])
+            scores = (1 - process_reward_mask.abs()) * scores + \
+                     torch.relu(process_reward_mask) * gmax + torch.relu(-process_reward_mask) * gmin
+            scores = scores * response_mask
+        else:
+            scores = scores.unsqueeze(dim=1).tile([1, response_length]) * response_mask
 
     return scores, scores
 
@@ -902,6 +1015,7 @@ def compute_policy_loss(
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
+# TODO@Miao: handle overlong masking in other losses
 
 @register_policy_loss("vanilla")  # type: ignore[arg-type]
 def compute_policy_loss_vanilla(
@@ -912,6 +1026,7 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    overlong_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -954,11 +1069,16 @@ def compute_policy_loss_vanilla(
         + f" but get the value: {clip_ratio_c}."
     )
 
+    # Combine masks: overlong_mask is per-sample 0/1 (0=exclude). Broadcast if needed.
+    effective_mask = response_mask if overlong_mask is None else (
+        (response_mask * (overlong_mask.view(-1, 1).expand_as(response_mask) if overlong_mask.dim() == 1 else overlong_mask)).to(response_mask.dtype)
+    )
+
     negative_approx_kl = log_prob - old_log_prob
     # Clamp negative_approx_kl for stability
     negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
     ratio = torch.exp(negative_approx_kl)
-    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, effective_mask)
 
     pg_losses1 = -advantages * ratio
     if cliprange_low is None:
@@ -971,12 +1091,12 @@ def compute_policy_loss_vanilla(
     clip_pg_losses1 = torch.maximum(
         pg_losses1, pg_losses2
     )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), effective_mask)
 
     pg_losses3 = -advantages * clip_ratio_c
     clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
     pg_clipfrac_lower = verl_F.masked_mean(
-        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
+        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), effective_mask
     )
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
@@ -986,7 +1106,7 @@ def compute_policy_loss_vanilla(
         pg_losses = pg_losses * rollout_is_weights
 
     pg_loss = agg_loss(
-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+        loss_mat=pg_losses, loss_mask=effective_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
     )
 
     pg_metrics = {
@@ -1006,6 +1126,7 @@ def compute_policy_loss_gspo(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    overlong_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -1082,6 +1203,7 @@ def compute_policy_loss_gpg(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    overlong_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Adapted from
     https://github.com/AMAP-ML/GPG/blob/main/VisualThinker-R1-Zero/src/open-r1-multimodal/src/open_r1/trainer/grpo_trainer.py#L495
@@ -1118,6 +1240,7 @@ def compute_policy_loss_clip_cov(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    overlong_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
@@ -1223,6 +1346,7 @@ def compute_policy_loss_kl_cov(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    overlong_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
@@ -1303,6 +1427,7 @@ def compute_policy_loss_geo_mean(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    overlong_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for GMPO.

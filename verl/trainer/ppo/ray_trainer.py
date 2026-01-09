@@ -239,6 +239,25 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.FOLDGRPO:
+        # Initialize the mask for FOLDGRPO calculation
+        token_level_rewards = data.batch["token_level_rewards"]
+        foldgrpo_calculation_mask = data.batch["response_mask"]
+        fix_bad_positive_adv = config.get("fix_bad_positive_adv", False)
+
+        # Call compute_foldgrpo_advantage with parameters matching its definition
+        advantages, returns = core_algos.compute_foldgrpo_advantage(
+            token_level_rewards=token_level_rewards,
+            response_mask=foldgrpo_calculation_mask,
+            index=data.non_tensor_batch["uid"],
+            gen_uid=data.non_tensor_batch["gen_uid"],
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            fix_bad_positive_adv=fix_bad_positive_adv,
+            process_reward_mask=data.batch["process_reward_mask"],
+            raw_token_level_scores=token_level_rewards if fix_bad_positive_adv else None,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -258,7 +277,7 @@ def compute_advantage(
         data.batch["returns"] = returns
     return data
 
-
+# TODO@Miao: Add plugin configs
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
@@ -974,6 +993,22 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def _pad_dummy_sample(self, batch: DataProto):
+        """Pad dummy sample to make batch size divisible by mini_batch_size"""
+        print(f"pad batch size from {len(batch)} to {len(batch) + self.config.actor_rollout_ref.actor.ppo_mini_batch_size - len(batch) % self.config.actor_rollout_ref.actor.ppo_mini_batch_size}")
+        global_mini_bs = self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.trainer.nnodes
+        assert 'response_mask' in batch.batch, "response_mask is required for defining padding dummy sample"
+        dummy_sample = deepcopy(batch[0:1])
+        dummy_sample.batch["response_mask"] = torch.ones_like(dummy_sample.batch["response_mask"])
+        dummy_sample.batch["overlong_mask"] = torch.zeros_like(dummy_sample.batch["overlong_mask"])
+        dummy_sample.batch["attention_mask"] = torch.zeros_like(dummy_sample.batch["attention_mask"])
+        dummy_sample.non_tensor_batch["uid"] = np.array([uuid.uuid4(),], dtype=object)
+        gen_uid_dummy = uuid.uuid4()
+        dummy_sample.non_tensor_batch["gen_uid"] = np.array([gen_uid_dummy,], dtype=object)
+        batch = DataProto.concat([batch] + [dummy_sample for _ in range(global_mini_bs - len(batch) % global_mini_bs)])
+        batch.meta_info["gen_uid_dummy"] = gen_uid_dummy
+        return batch, gen_uid_dummy
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1046,16 +1081,37 @@ class RayPPOTrainer:
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
                 # add uid to batch
+                import numpy as np
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
-                gen_batch = self._get_gen_batch(batch)
+                # gen_batch = self._get_gen_batch(batch)
 
                 # pass global_steps to trace
-                gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch_output = gen_batch.repeat(
+                # gen_batch.meta_info["global_steps"] = self.global_steps
+                # gen_batch_output = gen_batch.repeat(
+                #     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                # )
+
+                batch.meta_info["global_steps"] = self.global_steps
+                batch = batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                )
+
+                # TODO@Miao[DONE]: add uid for each sample in gen_batch_output. The key to the uid need to be different from "uid" 
+                # - "uid" -> question level (unique id for each question, repeated by self.config.actor_rollout_ref.rollout.n)
+                # - "gen_uid" -> sample level (unique id for each sample)
+                # gen_batch_output.non_tensor_batch["gen_uid"] = np.array(
+                #     [str(uuid.uuid4()) for _ in range(len(gen_batch_output.batch))], dtype=object
+                # )
+
+                batch.non_tensor_batch["gen_uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                )
+
+                batch.non_tensor_batch["workflow"] = np.array(
+                    [self.config.actor_rollout_ref.rollout.plugin.workflow for _ in range(len(batch.batch))], dtype=object
                 )
 
                 is_last_step = self.global_steps >= self.total_training_steps
@@ -1065,10 +1121,21 @@ class RayPPOTrainer:
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                         else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                            # TODO@Miao: revise fold_agent_loop.py
+                            # Pay attention to the keys of batch before and after generation 
+                            print("batch.keys():", batch.batch.keys())
+                            print("batch.non_tensor_batch.keys():", batch.non_tensor_batch.keys())
+                            print("batch.meta_info.keys():", batch.meta_info.keys())
+                            batch = self.async_rollout_manager.generate_sequences(batch)
+                            print("batch.keys():", batch.batch.keys())
+                            print("batch.non_tensor_batch.keys():", batch.non_tensor_batch.keys())
+                            print("batch.meta_info.keys():", batch.meta_info.keys())
 
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
+                        # timing_raw.update(gen_batch_output.meta_info["timing"])
+                        # gen_batch_output.meta_info.pop("timing", None)
+                        timing_raw.update(batch.meta_info["timing"])
+                        batch.meta_info.pop("timing", None)
+                        batch.meta_info["global_steps"] = self.global_steps
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1098,12 +1165,24 @@ class RayPPOTrainer:
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
+                    
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                    # batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    # batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    # TODO@Miao[DONE]: set overlong mask (batch.barch) according to mask_rollout (batch,non_tensor_batch)
+                    # TODO@Miao[Done]: Add mask_overlong config
+                    if self.config.algorithm.mask_overlong:
+                        batch.batch["overlong_mask"] = (~(batch.batch["mask_rollout"]).bool()).int()
+                        metrics.update({'overlong_masked': batch.batch["mask_rollout"].sum().item()})
+
+                    # TODO@Miao[DONE]: pad batch size to muliplicative of mini_batch_size
+                    if len(batch) % (self.config.actor_rollout_ref.actor.ppo_mini_batch_size * self.config.trainer.nnodes) != 0:
+                        batch, gen_uid_dummy = self._pad_dummy_sample(batch)
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1125,7 +1204,10 @@ class RayPPOTrainer:
                                 data=batch, config=self.config, tokenizer=self.tokenizer
                             )
                         else:
+                            # TODO@Miao: implement the reward_fn
+                            # - pay attention to the multiple trajectories of a rollout when calculating metrics
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            print(reward_tensor)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1219,6 +1301,8 @@ class RayPPOTrainer:
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
 
+                        # TODO@Miao[Done]: revise multiple trajectory advantage calculation
+                        # TODO@Miao[Done]: add algorithm.fix_bad_positive_adv config
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1244,6 +1328,9 @@ class RayPPOTrainer:
                             batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
                             # TODO: Make "temperature" single source of truth from generation.
                             batch.meta_info["temperature"] = rollout_config.temperature
+
+                            # TODO@Miao[Done]: revise policy gradient loss calculation to include overlong masking
+                            # - Pay attention to the influence of dummy samples when doing normalization
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
@@ -1309,6 +1396,33 @@ class RayPPOTrainer:
                         "training/epoch": epoch,
                     }
                 )
+
+                # TODO@Miao[Done]: update metrics from reward_extra_infos_dict (where we calculated metrics deduplicated by gen_uid)
+                if reward_extra_infos_dict:
+                    import numpy as np
+
+                    def _scalarize(name, values):
+                        # values are per-sample arrays; some are repeated batch-level metrics (e.g., avg_score),
+                        # others are per-sample metrics (e.g., reward_score)
+                        arr = np.array(values)
+                        if arr.size == 0:
+                            return None
+                        # If this is a batch-level metric repeated across samples, take the first element
+                        if name in {"avg_score", "std_score", "min_score", "max_score",
+                                    "num_unique_gen_uids", "avg_trajs_per_gen_uid",
+                                    "overlong_rate", "avg_num_turns"}:
+                            return float(arr[0])
+                        # Otherwise use mean over samples
+                        try:
+                            return float(arr.astype(float).mean())
+                        except Exception:
+                            return None
+
+                    for key, val in reward_extra_infos_dict.items():
+                        scalar_val = _scalarize(key, val)
+                        if scalar_val is not None:
+                            metrics[f"reward/{key}"] = scalar_val
+                            
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))

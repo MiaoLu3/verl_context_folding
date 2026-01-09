@@ -372,6 +372,7 @@ class DataParallelPPOActor(BasePPOActor):
         log_probs_lst = []
         entropy_lst = []
         for micro_batch in micro_batches:
+            print(f"[DP ACTOR] Dynamic bsz, micro batch size: {len(micro_batch)}")
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
@@ -450,6 +451,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
+                    overlong_mask = model_inputs.get("overlong_mask", None)
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
 
@@ -497,6 +499,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
+                        overlong_mask=overlong_mask,
                     )
                     micro_batch_metrics.update(pg_metrics)
 

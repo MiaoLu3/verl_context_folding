@@ -173,6 +173,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Multi-modal inputs for processors (e.g., pixel_values, image_grid_thw)."""
     extra_fields: dict[str, Any] = {}
     """Extra fields for dynamic addition."""
+    process_reward_mask: Optional[torch.Tensor] = None
+    """Padded process reward mask."""
 
 
 # make hydra.utils.instantiate happy
@@ -385,6 +387,7 @@ class AgentLoopWorkerBase:
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+            kwargs.update({k: v for k, v in batch.meta_info.items()}) 
             tasks.append(
                 asyncio.create_task(
                     self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
@@ -392,7 +395,18 @@ class AgentLoopWorkerBase:
             )
         outputs = await asyncio.gather(*tasks)
 
-        output = self._postprocess(outputs)
+        # Flatten outputs: each _run_agent_loop returns list[_InternalAgentLoopOutput]
+        # For single-output agent loops, this is a list with one element
+        # For multi-output agent loops (e.g., FoldAgentLoop), this can have multiple elements
+        flattened_outputs = []
+        for output_list in outputs:
+            if isinstance(output_list, list):
+                flattened_outputs.extend(output_list)
+            else:
+                # Backward compatibility: if somehow a single output is returned
+                flattened_outputs.append(output_list)
+
+        output = self._postprocess(flattened_outputs)
 
         return output
 
@@ -404,7 +418,15 @@ class AgentLoopWorkerBase:
         agent_name: str,
         trace: bool = True,
         **kwargs,
-    ) -> _InternalAgentLoopOutput:
+    ) -> list[_InternalAgentLoopOutput]:
+        """
+        Run an agent loop and return processed outputs.
+
+        Returns:
+            list[_InternalAgentLoopOutput]: A list of processed outputs.
+            Most agent loops return a single output (wrapped in a list for consistency),
+            but some (e.g., FoldAgentLoop) may return multiple outputs (one per agent trajectory).
+        """
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -425,8 +447,19 @@ class AgentLoopWorkerBase:
                 tokenizer=self.tokenizer,
                 processor=self.processor,
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, **kwargs)
+            output = await agent_loop.run(sampling_params, **kwargs)
+
+            # Handle both single AgentLoopOutput and list[AgentLoopOutput]
+            if isinstance(output, list):
+                # Agent loop returned multiple outputs (e.g., FoldAgentLoop)
+                processed_outputs = []
+                for single_output in output:
+                    processed = await self._agent_loop_postprocess(single_output, **kwargs)
+                    processed_outputs.append(processed)
+                return processed_outputs
+            else:
+                # Single output (most agent loops) - wrap in list for consistency
+                return [await self._agent_loop_postprocess(output, **kwargs)]
 
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
@@ -494,6 +527,14 @@ class AgentLoopWorkerBase:
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
+
+        process_reward_mask = None
+        prm_list = output.extra_fields.get("process_reward_mask", None)
+        if prm_list is not None:
+            pad_size = self.config.actor_rollout_ref.rollout.response_length - len(prm_list)
+            prm = torch.tensor(prm_list + [0] * max(pad_size, 0), dtype=torch.int8).unsqueeze(0)
+            process_reward_mask = prm * response_mask.to(torch.int8)
+
 
         routed_experts = None
         if output.routed_experts is not None:
@@ -594,6 +635,7 @@ class AgentLoopWorkerBase:
             num_turns=output.num_turns,
             metrics=output.metrics,
             extra_fields=output.extra_fields,
+            process_reward_mask=process_reward_mask,
         )
 
     def _postprocess(self, inputs: list[_InternalAgentLoopOutput]) -> DataProto:
@@ -611,6 +653,14 @@ class AgentLoopWorkerBase:
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
 
+        process_reward_mask = None
+        if inputs[0].process_reward_mask is not None:
+            process_reward_mask = torch.cat([input.process_reward_mask for input in inputs], dim=0)
+
+        mask_rollout = None
+        if inputs[0].extra_fields.get("mask_rollout", None) is not None:
+            mask_rollout = torch.cat([torch.tensor([input.extra_fields["mask_rollout"]]) for input in inputs], dim=0)
+
         batch = TensorDict(
             {
                 "prompts": prompt_ids,  # [bsz, prompt_length]
@@ -624,6 +674,10 @@ class AgentLoopWorkerBase:
             },
             batch_size=len(inputs),
         )
+        if process_reward_mask is not None:
+            batch["process_reward_mask"] = process_reward_mask.to(torch.int8)
+        if mask_rollout is not None:
+            batch["mask_rollout"] = mask_rollout
 
         scores = [input.reward_score for input in inputs]
         if all(score is not None for score in scores):

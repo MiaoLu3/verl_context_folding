@@ -1,0 +1,2 @@
+pip install tensordict==0.10.0 --upgrade --user
+pip install --no-deps -e .
