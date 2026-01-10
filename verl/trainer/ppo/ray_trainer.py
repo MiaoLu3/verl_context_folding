@@ -530,23 +530,6 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
-    def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
-
-        # pop those keys for generation
-        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
-        gen_batch = batch.pop(
-            batch_keys=batch_keys_to_pop,
-            non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
-        )
-
-        # For agent loop, we need reward model keys to compute score.
-        if self.async_rollout_mode:
-            gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
-
-        return gen_batch
-
     def _validate(self):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
@@ -562,14 +545,29 @@ class RayPPOTrainer:
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
 
-            if "uid" not in test_batch.non_tensor_batch:
-                test_batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
-                )
+            # Set temperature in meta_info (aligned with fit())
+            test_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+
+            # Add uid to batch (aligned with fit() - always create new uids)
+            test_batch.non_tensor_batch["uid"] = np.array(
+                [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
+            )
+
+            test_batch.meta_info["global_steps"] = self.global_steps
 
             # repeat test batch
             test_batch = test_batch.repeat(
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
+            )
+
+            # Add gen_uid to batch after repeat (aligned with fit())
+            test_batch.non_tensor_batch["gen_uid"] = np.array(
+                [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
+            )
+
+            # Add workflow to batch (aligned with fit())
+            test_batch.non_tensor_batch["workflow"] = np.array(
+                [self.config.actor_rollout_ref.rollout.plugin.workflow for _ in range(len(test_batch.batch))], dtype=object
             )
 
             # we only do validation on rule-based rm
@@ -588,53 +586,50 @@ class RayPPOTrainer:
             ]
             sample_gts.extend(ground_truths)
 
-            test_gen_batch = self._get_gen_batch(test_batch)
-            test_gen_batch.meta_info = {
+            # Set meta_info for generation (aligned with fit())
+            test_batch.meta_info.update({
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
                 "recompute_log_prob": False,
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 "validate": True,
-                "global_steps": self.global_steps,
-            }
-            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+            })
+            print(f"test_batch meta info: {test_batch.meta_info}")
 
-            # pad to be divisible by dp_size
-            size_divisor = (
-                self.actor_rollout_wg.world_size
-                if not self.async_rollout_mode
-                else self.config.actor_rollout_ref.rollout.agent.num_workers
-            )
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            # Generate sequences (aligned with fit() - no padding before generation)
             if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                test_batch = self.actor_rollout_wg.generate_sequences(test_batch)
             else:
-                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+                test_batch = self.async_rollout_manager.generate_sequences(test_batch)
 
-            # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            # Update timing from meta_info if available (aligned with fit())
+            if "timing" in test_batch.meta_info:
+                test_batch.meta_info.pop("timing", None)
+            test_batch.meta_info["global_steps"] = self.global_steps
 
             print("validation generation end")
 
+            # Compute response_mask if not present (aligned with fit())
+            if "response_mask" not in test_batch.batch.keys():
+                test_batch.batch["response_mask"] = compute_response_mask(test_batch)
+
             # Store generated outputs
-            output_ids = test_output_gen_batch.batch["responses"]
+            output_ids = test_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
-            test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
-            # evaluate using reward_function
+            # Evaluate using reward_function (aligned with fit() using compute_reward)
             if self.val_reward_fn is None:
                 raise ValueError("val_reward_fn must be provided for validation.")
-            result = self.val_reward_fn(test_batch, return_dict=True)
-            reward_tensor = result["reward_tensor"]
+            reward_tensor, reward_extra_info = compute_reward(test_batch, self.val_reward_fn)
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
             reward_extra_infos_dict["reward"].extend(scores)
-            if "reward_extra_info" in result:
-                for key, lst in result["reward_extra_info"].items():
+            if reward_extra_info:
+                for key, lst in reward_extra_info.items():
                     reward_extra_infos_dict[key].extend(lst)
 
             # collect num_turns of each prompt
@@ -679,6 +674,30 @@ class RayPPOTrainer:
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+
+        # Add scalarized reward_extra_info metrics with val/ prefix (aligned with fit())
+        if reward_extra_infos_dict:
+            def _scalarize(name, values):
+                # values are per-sample arrays; some are repeated batch-level metrics (e.g., avg_score),
+                # others are per-sample metrics (e.g., reward_score)
+                arr = np.array(values)
+                if arr.size == 0:
+                    return None
+                # If this is a batch-level metric repeated across samples, take the first element
+                if name in {"avg_score", "std_score", "min_score", "max_score",
+                            "num_unique_gen_uids", "avg_trajs_per_gen_uid",
+                            "overlong_rate", "avg_num_turns"}:
+                    return float(arr[0])
+                # Otherwise use mean over samples
+                try:
+                    return float(arr.astype(float).mean())
+                except Exception:
+                    return None
+
+            for key, val in reward_extra_infos_dict.items():
+                scalar_val = _scalarize(key, val)
+                if scalar_val is not None:
+                    metric_dict[f"val/{key}"] = scalar_val
 
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)
@@ -1086,25 +1105,14 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
-                # gen_batch = self._get_gen_batch(batch)
-
-                # pass global_steps to trace
-                # gen_batch.meta_info["global_steps"] = self.global_steps
-                # gen_batch_output = gen_batch.repeat(
-                #     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                # )
-
                 batch.meta_info["global_steps"] = self.global_steps
                 batch = batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
 
-                # TODO@Miao[DONE]: add uid for each sample in gen_batch_output. The key to the uid need to be different from "uid" 
+                # TODO@Miao[DONE]: add uid for each sample in batch. The key to the uid need to be different from "uid" 
                 # - "uid" -> question level (unique id for each question, repeated by self.config.actor_rollout_ref.rollout.n)
                 # - "gen_uid" -> sample level (unique id for each sample)
-                # gen_batch_output.non_tensor_batch["gen_uid"] = np.array(
-                #     [str(uuid.uuid4()) for _ in range(len(gen_batch_output.batch))], dtype=object
-                # )
 
                 batch.non_tensor_batch["gen_uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
@@ -1119,56 +1127,14 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                            batch = self.actor_rollout_wg.generate_sequences(batch)
                         else:
                             # TODO@Miao: revise fold_agent_loop.py
-                            # Pay attention to the keys of batch before and after generation 
-                            print("batch.keys():", batch.batch.keys())
-                            print("batch.non_tensor_batch.keys():", batch.non_tensor_batch.keys())
-                            print("batch.meta_info.keys():", batch.meta_info.keys())
                             batch = self.async_rollout_manager.generate_sequences(batch)
-                            print("batch.keys():", batch.batch.keys())
-                            print("batch.non_tensor_batch.keys():", batch.non_tensor_batch.keys())
-                            print("batch.meta_info.keys():", batch.meta_info.keys())
 
-                        # timing_raw.update(gen_batch_output.meta_info["timing"])
-                        # gen_batch_output.meta_info.pop("timing", None)
                         timing_raw.update(batch.meta_info["timing"])
                         batch.meta_info.pop("timing", None)
                         batch.meta_info["global_steps"] = self.global_steps
-
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        if self.reward_fn is None:
-                            raise ValueError("A reward_fn is required for REMAX advantage estimation.")
-
-                        with marked_timer("gen_max", timing_raw, color="purple"):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info["do_sample"] = False
-                            if not self.async_rollout_mode:
-                                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
-                            else:
-                                gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
-                            batch = batch.union(gen_baseline_output)
-                            # compute reward model score on batch
-                            rm_scores = None
-                            if self.use_rm and "rm_scores" not in batch.batch.keys():
-                                rm_scores = self.rm_wg.compute_rm_score(batch)
-                                batch = batch.union(rm_scores)
-                            reward_baseline_tensor, _ = compute_reward(batch, self.reward_fn)
-                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
-
-                            keys_to_pop = set(gen_baseline_output.batch.keys())
-                            if rm_scores is not None:
-                                keys_to_pop.update(rm_scores.batch.keys())
-                            batch.pop(batch_keys=list(keys_to_pop))
-
-                            batch.batch["reward_baselines"] = reward_baseline_tensor
-
-                            del rm_scores, gen_baseline_batch, gen_baseline_output
-                    
-                    # repeat to align with repeated responses in rollout
-                    # batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    # batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
