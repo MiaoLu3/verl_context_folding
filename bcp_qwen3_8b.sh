@@ -1,25 +1,27 @@
-# actor_rollout_ref.model.path=/home/tiger/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c \
-
+MODEL_PATH=Qwen/Qwen3-8B
+TRAIN_FILE=bc_train_mh.parquet
+TEST_FILE=bc_test_emh.parquet
 PROMPT_LENGTH=4096
 RESPONSE_LENGTH=32768
 MAX_LENGTH=36864
 
+
 python -m verl.trainer.main_ppo \
   algorithm.adv_estimator=foldgrpo \
+  actor_rollout_ref.rollout.agent.default_agent_loop=fold_agent \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.mode=async \
   actor_rollout_ref.rollout.calculate_log_probs=True \
-  actor_rollout_ref.model.path=/home/tiger/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218 \
+  actor_rollout_ref.model.path=${MODEL_PATH} \
   actor_rollout_ref.rollout.prompt_length=${PROMPT_LENGTH} \
   actor_rollout_ref.rollout.response_length=${RESPONSE_LENGTH} \
   actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${MAX_LENGTH} \
   actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
   actor_rollout_ref.rollout.n=32 \
-  actor_rollout_ref.rollout.agent.default_agent_loop=fold_agent \
   actor_rollout_ref.rollout.agent.num_workers=1 \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
-  data.train_files=/opt/tiger/verl_context_folding/bc_train_mh.parquet \
-  data.val_files=/opt/tiger/verl_context_folding/bc_test_emh.parquet \
+  data.train_files=${TRAIN_FILE} \
+  data.val_files=${TEST_FILE} \
   data.train_batch_size=8 \
   data.max_prompt_length=${PROMPT_LENGTH} \
   data.max_response_length=${RESPONSE_LENGTH} \
