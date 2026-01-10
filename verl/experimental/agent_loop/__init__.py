@@ -15,8 +15,8 @@
 from .agent_loop import AgentLoopBase, AgentLoopManager, AgentLoopWorker, AsyncLLMServerManager
 from .single_turn_agent_loop import SingleTurnAgentLoop
 from .tool_agent_loop import ToolAgentLoop
-from .FoldAgent.react_agent_loop import ReactAgentLoop
+from .FoldAgent.fold_agent_loop import FoldAgentLoop
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop, ReactAgentLoop]
+_ = [SingleTurnAgentLoop, ToolAgentLoop, FoldAgentLoop]
 
-__all__ = ["AgentLoopBase", "AgentLoopManager", "AsyncLLMServerManager", "AgentLoopWorker", "ReactAgentLoop"]
+__all__ = ["AgentLoopBase", "AgentLoopManager", "AsyncLLMServerManager", "AgentLoopWorker", "FoldAgentLoop"]

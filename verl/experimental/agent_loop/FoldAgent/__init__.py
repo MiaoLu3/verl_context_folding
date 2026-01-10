@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-FoldAgent - ReAct and Fold agent implementations for VERL.
+FoldAgent - Fold agent implementations for VERL.
 
 This package provides agent loop implementations that work with VERL's
 training infrastructure while keeping custom tool parsing and environments.
 """
 
-from .react_agent_loop import ReactAgentLoop
 from .fold_agent_loop import FoldAgentLoop
 
 __all__ = ["ReactAgentLoop", "FoldAgentLoop"]
