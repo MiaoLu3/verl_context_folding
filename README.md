@@ -1,6 +1,10 @@
 # Context-Folding: Scaling Long-Horizon LLM Agents
 
-This repository contains the implementation of **Context-Folding**, a framework that empowers LLM agents to actively manage their working context for long-horizon tasks. Built on top of [verl](https://github.com/volcengine/verl).
+>**Warning⚠️:** This repository is under active development. The code has been tested to run correctly, but full validation of training results is still in progress.
+
+This repository contains the RL training implementation of **Context-Folding**, a framework that empowers LLM agents to actively manage their working context for long-horizon tasks. Built on top of [VeRL](https://github.com/volcengine/verl).
+
+
 
 **Paper:** [Scaling Long-Horizon LLM Agent via Context-Folding](https://arxiv.org/abs/2510.11967)
 
@@ -8,9 +12,7 @@ This repository contains the implementation of **Context-Folding**, a framework 
 
 ## Abstract
 
-Large language model (LLM) agents are fundamentally constrained by context length on long-horizon tasks. We introduce **Context-Folding**, a framework that empowers agents to actively manage their working context. An agent can procedurally **branch** into a sub-trajectory to handle a subtask and then **fold** it upon completion, collapsing the intermediate steps while retaining a concise summary of the outcome. To make this behavior learnable, we develop an end-to-end reinforcement learning framework **FoldGRPO** with specific process rewards to encourage effective task decomposition and context management.
-
-On complex long-horizon tasks like Deep Research, our folding agent matches or outperforms the ReAct baselines while using an active context **10x smaller** and significantly outperforms models that rely on summarization-based context management.
+Large language model (LLM) agents are fundamentally constrained by context length on long-horizon tasks. We introduce **Context-Folding**, a framework that empowers agents to actively manage their working context. An agent can procedurally **branch** into a sub-trajectory to handle a subtask and then **fold** it upon completion, collapsing the intermediate steps while retaining a concise summary of the outcome. To make this behavior learnable, we develop an end-to-end reinforcement learning framework **FoldGRPO** with specific process rewards to encourage effective task decomposition and context management. On complex long-horizon tasks like Deep Research, our folding agent matches or outperforms the ReAct baselines while using an active context **10x smaller** and significantly outperforms models that rely on summarization-based context management.
 
 ## Key Results
 
