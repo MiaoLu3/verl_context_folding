@@ -350,7 +350,6 @@ class FoldAgentLoop(AgentLoopBase):
                     self.meta_info = kwargs.get('meta_info', {})
 
             item_proxy = ItemProxy(kwargs)
-            print(item_proxy.non_tensor_batch)
             await env.init_env(item_proxy)
         except Exception as e:
             logger.error(f"Error during environment init: {e}")
@@ -365,7 +364,6 @@ class FoldAgentLoop(AgentLoopBase):
 
         # Create chat using the environment's problem statement
         workflow = kwargs.get('workflow', 'search')
-        print("workflow:", workflow)
         if hasattr(env, 'instance_info') and 'problem_statement' in env.instance_info:
             user_prompt = create_chat(env.instance_info['problem_statement'], workflow, item_proxy)
         else:
@@ -402,8 +400,6 @@ class FoldAgentLoop(AgentLoopBase):
 
         # Main agent loop
         while iteration < max_turn:
-            print(f"Current iter: {iteration}")
-            print(f"Max turn: {max_turn}")
 
             if time.time() - session_start_time > self.session_timeout:
                 logger.info('Session Timeout')
@@ -413,8 +409,6 @@ class FoldAgentLoop(AgentLoopBase):
 
             # Check for session summarization (context getting full)
             if self.enable_summary and agents[current].get_current_response_length() > self.response_length * 0.95:
-                
-                print('SUMMARIZING')
 
                 if len(agents) >= self.max_session:
                     logger.info(f'Session OOC after {len(agents)} sessions')
@@ -451,14 +445,10 @@ class FoldAgentLoop(AgentLoopBase):
                 session_message.append({'role': 'user', 'content': next_session_prompt})
 
             # Generate main agent response
-            print("Generating response")
             response = await self._generate_step(
                 agents[current], sampling_params, request_id, metrics
             )
-            print("Response generated")
-
             if response is None:
-                print("Response is None!!")
                 break
 
             session_message.append({'role': 'assistant', 'content': response})
@@ -474,7 +464,6 @@ class FoldAgentLoop(AgentLoopBase):
                     description = fn_call['arguments'].get('description', 'Agent')
                     message_to_branch = fn_call['arguments'].get('prompt', 'Empty prompt')
                     logger.info(f'[BRANCH] {description}')
-                    print(f"[BRANCHING] Branch message: {message_to_branch}")
 
                     agent_name = f"#{len(branches)}-" + description.replace(' ', '_')
                     branches.append(agent_name)
@@ -661,29 +650,6 @@ class FoldAgentLoop(AgentLoopBase):
             idx = [0] + sorted(random.sample(range(1, len(outputs)), k=self.max_traj - 1))
             outputs = [outputs[i] for i in idx]
 
-        # Debug: investigate trajectories whose response_mask is all zeros
-        try:
-            for out in outputs:
-                mask = out.response_mask
-                is_all_zero = True
-                for v in mask:
-                    if v != 0:
-                        is_all_zero = False
-                        break
-                if is_all_zero:
-                    print("[DEBUG] FoldAgentLoop: response_mask all zero; investigating trajectory")
-                    print("  agent_name:", out.extra_fields.get("agent_name"))
-                    print("  mask_rollout:", out.extra_fields.get("mask_rollout"))
-                    print("  env_stats:", out.extra_fields.get("env_stats"))
-                    msgs = out.extra_fields.get("messages")
-                    if msgs is not None:
-                        print("  messages:")
-                        try:
-                            print(print_chat(msgs))
-                        except Exception:
-                            print(msgs)
-        except Exception as e:
-            print("[DEBUG] FoldAgentLoop: error during all-zero response_mask debug:", e)
         return outputs
 
     async def _apply_process_rewards(
@@ -818,13 +784,10 @@ class FoldAgentLoop(AgentLoopBase):
         prompt_ids = agent_ctx.get_prompt_ids()
 
         max_total_len = self.prompt_length + self.response_length
-        print("max_total_len:", max_total_len)
         current_len = len(prompt_ids) + agent_ctx.get_current_response_length()
-        print("current_len:", current_len)
         max_new_tokens = max_total_len - current_len
 
         if max_new_tokens < 10:
-            print("max new tokens too small!!")
             logger.info(f"max_new_tokens {max_new_tokens} too small, stopping")
             return None
 
@@ -890,15 +853,12 @@ class FoldAgentLoop(AgentLoopBase):
 
         max_response_tokens = max_tokens if max_tokens else self.response_length - 512
 
-        print("[BRANCH] Starting branch, branch remaining turn:", max_turn - iteration, "branch remaining tokens:", max_response_tokens)
-
         while iteration < max_turn:
             if time.time() - branch_start > timeout:
                 logger.info('[BRANCH] Timeout')
                 break
 
             if len(agent_ctx.context()) - init_len > max_response_tokens:
-                print("[BRANCH] Context full, current context length:", len(agent_ctx.context()), "Initial len:", init_len)
                 # Context full, force summary/return
                 agent_ctx.append_user(
                     "The context limit has been exceeded for the branch. Please finish the sub task directly "
@@ -914,14 +874,12 @@ class FoldAgentLoop(AgentLoopBase):
 
             response = await self._generate_step(agent_ctx, sampling_params, request_id, metrics)
             if response is None:
-                print("[BRANCH] Generate step None, break")
                 break
 
             last_response = response
 
             # Check for return/finish
             if '<function=return>' in response:
-                print("[BRANCH] Return/Finish, break")
                 break
 
             # Check for invalid branch actions
@@ -935,7 +893,6 @@ class FoldAgentLoop(AgentLoopBase):
                     observation = await run_action(env, response)
 
                 if observation is None:
-                    print("[BRANCH] Tool call None, break")
                     break
 
             observation += f"\n* You are now in branch mode: {description}. Conduct the sub task based on instruction, and when you complete the assigned sub task, use return tool to return, do not perform action beyond the assigned sub task."
@@ -946,3 +903,4 @@ class FoldAgentLoop(AgentLoopBase):
             'last_response': last_response or '',
             'iteration': iteration,
         }
+    

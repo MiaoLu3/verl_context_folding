@@ -177,27 +177,7 @@ def relaxed_em(label: str, pred: str) -> bool:
     if sum((ca&cb).values())/min(len(A),len(B) or 1)>=0.9: return True
     return False
 
-
-async def call_openai(messages, model='gpt-5-nano', max_retries=3):
-    openai_url = "http://[fdbd:dc03:15:203::146]:8000/chat"
-    for attempt in range(max_retries):
-        try:
-            async with httpx.AsyncClient(timeout=300.0) as c:
-                r = await c.post(openai_url, json={
-                    "model": model,
-                    "messages": messages
-                })
-                r.raise_for_status()
-                return r.json()["content"]
-        except Exception as e:
-            if attempt == max_retries - 1:
-                print(f"[CALL OPENAI] Error after {max_retries} attempts: {str(e)}")
-                return f"Error after {max_retries} attempts: {str(e)}"
-            await asyncio.sleep(1 * (attempt + 1))
-    return ""
-
-
-async def call_openai_raw(messages, model='gpt-4o-mini', max_retries=3):
+async def call_openai_raw(messages, model='gpt-5-nano', max_retries=3):
     from openai import AsyncOpenAI
     if isinstance(messages, str):
         messages = [{'role': 'user', 'content': messages}]
@@ -231,14 +211,14 @@ async def judge(question, correct_answer, predicted_answer):
         messages = [{'role': 'user', 'content': judge_prompt}]
         score = 0
         for _ in range(3):
-            response = await call_openai(messages)  # use call_openai for api proxy
+            response = await call_openai_raw(messages) 
             grade_report = parse_judge_response(response)
             if grade_report['parse_error']:
                 continue
             score = int(grade_report['correct'])
             break
         if score == 0 and relaxed_em(correct_answer, predicted_answer):
-            response = await call_openai(messages, model='gpt-4.1')  # use call_openai for api proxy
+            response = await call_openai_raw(messages, model='gpt-5-nano') 
             grade_report = parse_judge_response(response)
             score = int(grade_report.get('correct', 0))
 
@@ -333,7 +313,6 @@ def extract_fn_call(text):
         return None
     if '<tool_call>' in text or '<answer>' in text:
         json_tool = extract_json_tool(text)
-        print(json_tool)
         if len(json_tool) > 0:
             return json_tool
         else:
@@ -391,8 +370,8 @@ class LocalSearch:
         self.question = item.non_tensor_batch['extra_info'][0]['query']
         self.label_answer = item.non_tensor_batch['extra_info'][0]['answer']
         self.predicted_answer = None
-        print("init self.question:", self.question)
-        print("init self.label_answer:", self.label_answer)
+        print("Question:", self.question)
+        print("Gold Answer:", self.label_answer)
 
     async def get_data(self, item, context):
         if 'prompt' in item.non_tensor_batch['extra_info'][0]:
@@ -495,7 +474,6 @@ class LocalSearch:
                     explanation = fn['arguments'].get('explanation', None)
                     confidence = fn['arguments'].get('confidence', None)
                     if len(answer.strip()) == 0:
-                        print("Finish response:", response)
                         observation = ("Fail to parse answer. Please resubmit with the correct tool call format, eg\n"
                                        "<function=finish>\n" "<parameter=answer>YOUR ANSWER</parameter>\n"
                                        "<parameter=explanation>YOUR EXPLANATION</parameter>\n"
@@ -506,7 +484,6 @@ class LocalSearch:
                             self.stats['change_answer'] += 1
 
                     if self.stats['search'] == 0:
-                        print("[Search = 0] Label answer:", self.label_answer, "Predicted answer:", answer)
                         if em_score(self.label_answer, answer) and self.must_search:
                             observation = "Answer submission failed. You MUST use the search tool to verify the answer and all the evidence, and cite the correct source document in your explanation to support your claim."
                             self.must_search = False
@@ -560,22 +537,17 @@ Once you’re confident everything is covered and verified, submit the final ans
         if self.predicted_answer is None:
             print("[Not Judged] Predicted answer is None, return 0 reward")
             return "", 0, {}
-        print("Label answer:", self.label_answer)
-        print("Predicted answer:", self.predicted_answer)
+        print("Gold Answer:", self.label_answer)
+        print("Predicted Answer:", self.predicted_answer)
         if '<q1>' in self.label_answer:
             label_answer_dict = extract_q_dict(self.label_answer)
-            print("extracted label answer dict:", label_answer_dict)
             predicted_answer_dict = extract_q_dict(self.predicted_answer[0])
-            print("extracted predicted answer dict:", predicted_answer_dict)
             all_reward = []
             for k in label_answer_dict:
                 if k in predicted_answer_dict:
-                    print(f"judging question {k}")
                     reward = await judge(self.question, label_answer_dict[k], predicted_answer_dict[k])
-                    print(f"judge reward for question {k}:", reward)
                     all_reward.append(reward)
                 else:
-                    print(f"question {k} not in predicted answer dict")
                     all_reward.append(0)
             reward = sum(all_reward) / len(all_reward)
             return "", reward, {}
@@ -600,7 +572,6 @@ Once you’re confident everything is covered and verified, submit the final ans
         return out
 
 def extract_q_dict(s: str) -> dict[str, str]:
-    print(f"extracting q dict from {s}")
     return {k: v.strip() for k, v in re.findall(r'<(q\d+)>(.*?)</\1>', s, flags=re.S)}
 
 

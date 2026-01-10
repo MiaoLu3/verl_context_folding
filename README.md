@@ -128,37 +128,6 @@ Example using the provided script:
 bash bcp_qwen3_8b.sh
 ```
 
-Or run directly:
-
-```bash
-PROMPT_LENGTH=4096
-RESPONSE_LENGTH=32768
-MAX_LENGTH=36864
-
-python -m verl.trainer.main_ppo \
-  algorithm.adv_estimator=foldgrpo \
-  actor_rollout_ref.rollout.name=vllm \
-  actor_rollout_ref.rollout.mode=async \
-  actor_rollout_ref.model.path=/path/to/your/model \
-  actor_rollout_ref.rollout.prompt_length=${PROMPT_LENGTH} \
-  actor_rollout_ref.rollout.response_length=${RESPONSE_LENGTH} \
-  actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
-  actor_rollout_ref.rollout.n=32 \
-  actor_rollout_ref.rollout.agent.default_agent_loop=fold_agent \
-  data.train_files=/path/to/train.parquet \
-  data.val_files=/path/to/val.parquet \
-  data.train_batch_size=8 \
-  +actor_rollout_ref.rollout.plugin.workflow=search_branch \
-  +actor_rollout_ref.rollout.plugin.max_turn=20 \
-  +actor_rollout_ref.rollout.plugin.max_session=10 \
-  +actor_rollout_ref.rollout.plugin.branch_len=32768 \
-  +actor_rollout_ref.rollout.plugin.process_reward='[flat,scope]' \
-  trainer.n_gpus_per_node=8 \
-  trainer.total_training_steps=50 \
-  trainer.project_name=context_folding \
-  trainer.experiment_name=foldgrpo_run
-```
-
 ## Key Configuration Options
 
 ### Agent Loop Settings
@@ -166,8 +135,8 @@ python -m verl.trainer.main_ppo \
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `agent.default_agent_loop` | - | Set to `fold_agent` to use Context-Folding |
-| `plugin.workflow` | `search` | Workflow type: `search_branch` for deep research |
-| `plugin.max_turn` | 64 | Maximum turns per episode |
+| `plugin.workflow` | `search` | Workflow type: `search_branch` for folding agent |
+| `plugin.max_turn` | 100 | Maximum turns per rollout |
 | `plugin.max_session` | 10 | Maximum number of branches |
 | `plugin.branch_len` | 32768 | Maximum tokens per branch |
 | `plugin.session_timeout` | 5400 | Session timeout in seconds |
@@ -188,9 +157,9 @@ python -m verl.trainer.main_ppo \
 |-----------|---------|-------------|
 | `rollout.prompt_length` | 4096 | Maximum prompt length |
 | `rollout.response_length` | 32768 | Maximum response length (32K active context) |
-| `rollout.n` | 32 | Number of rollout samples (group size 8) |
-| `actor.ppo_mini_batch_size` | 128 | PPO batch size |
-| `trainer.total_training_steps` | 50 | Training steps (~2 epochs) |
+| `rollout.n` | 32 | Number of rollout samples |
+| `actor.ppo_mini_batch_size` | 8 | PPO mini batch size |
+| `trainer.total_training_steps` | 100 | Total training steps |
 
 ## Tools Available to the Agent
 
